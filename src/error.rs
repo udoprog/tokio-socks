@@ -63,6 +63,9 @@ pub enum Error {
     /// Password auth failure
     #[fail(display = "Password auth failure, code: {}", _0)]
     PasswordAuthFailure(u8),
+    /// UDP bind failure
+    #[fail(display = "Unable to bind a UDP socket")]
+    UdpBindFailure,
 }
 
 impl From<std::io::Error> for Error {

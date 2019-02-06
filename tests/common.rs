@@ -8,11 +8,9 @@ use tokio::{
     runtime::Runtime,
 };
 use tokio_socks::{
-    tcp::{BindFuture, ConnectFuture},
-    Error,
+    v5::{BindFuture, ConnectFuture},
+    Error, Result,
 };
-
-type Result<T> = std::result::Result<T, Error>;
 
 pub const PROXY_ADDR: &'static str = "127.0.0.1:41080";
 pub const ECHO_SERVER_ADDR: &'static str = "localhost:10007";

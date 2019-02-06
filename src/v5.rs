@@ -1,4 +1,4 @@
-use crate::{Authentication, Error, IntoTargetAddr, Result, TargetAddr, ToProxyAddrs};
+use crate::{Authentication, Error, IntoTargetAddr, Result, TargetAddr, ToProxyAddrs, TargetAddrsStream};
 use bytes::{Buf, BufMut};
 use derefable::Derefable;
 use futures::{stream, try_ready, Async, Future, Poll, Stream};
@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_tcp::{ConnectFuture as TokioConnect, TcpStream};
+use tokio_udp::UdpSocket;
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -37,7 +38,12 @@ impl Socks5Stream {
         P: ToProxyAddrs,
         T: IntoTargetAddr<'t>,
     {
-        Self::connect_raw(proxy, target, Authentication::None, Command::Connect)
+        ConnectFuture::new(
+            Authentication::None,
+            Command::Connect,
+            proxy.to_proxy_addrs(),
+            target.into_target_addr()?,
+        )
     }
 
     /// Connects to a target server through a SOCKS5 proxy using given username and password.
@@ -55,44 +61,12 @@ impl Socks5Stream {
         P: ToProxyAddrs,
         T: IntoTargetAddr<'t>,
     {
-        Self::connect_raw(
-            proxy,
-            target,
+        ConnectFuture::new(
             Authentication::Password { username, password },
             Command::Connect,
-        )
-    }
-
-    fn connect_raw<'a, 't, P, T>(
-        proxy: P,
-        target: T,
-        auth: Authentication<'a>,
-        command: Command,
-    ) -> Result<ConnectFuture<'a, 't, P::Output>>
-    where
-        P: ToProxyAddrs,
-        T: IntoTargetAddr<'t>,
-    {
-        if let Authentication::Password { username, password } = auth {
-            let username_len = username.as_bytes().len();
-            if username_len < 1 || username_len > 255 {
-                Err(Error::InvalidAuthValues(
-                    "username length should between 1 to 255",
-                ))?
-            }
-            let password_len = password.as_bytes().len();
-            if password_len < 1 || password_len > 255 {
-                Err(Error::InvalidAuthValues(
-                    "password length should between 1 to 255",
-                ))?
-            }
-        }
-        Ok(ConnectFuture::new(
-            auth,
-            command,
             proxy.to_proxy_addrs(),
             target.into_target_addr()?,
-        ))
+        )
     }
 
     /// Consumes the `Socks5Stream`, returning the inner `tokio_tcp::TcpStream`.
@@ -131,8 +105,28 @@ impl<'a, 't, S> ConnectFuture<'a, 't, S>
 where
     S: Stream<Item = SocketAddr, Error = Error>,
 {
-    fn new(auth: Authentication<'a>, command: Command, proxy: S, target: TargetAddr<'t>) -> Self {
-        ConnectFuture {
+    fn new(
+        auth: Authentication<'a>,
+        command: Command,
+        proxy: S,
+        target: TargetAddr<'t>,
+    ) -> Result<Self> {
+        if let Authentication::Password { username, password } = auth {
+            let username_len = username.as_bytes().len();
+            if username_len < 1 || username_len > 255 {
+                Err(Error::InvalidAuthValues(
+                    "username length should between 1 to 255",
+                ))?
+            }
+            let password_len = password.as_bytes().len();
+            if password_len < 1 || password_len > 255 {
+                Err(Error::InvalidAuthValues(
+                    "password length should between 1 to 255",
+                ))?
+            }
+        }
+
+        Ok(ConnectFuture {
             auth,
             command,
             proxy,
@@ -141,7 +135,7 @@ where
             buf: [0; 262],
             ptr: 0,
             len: 0,
-        }
+        })
     }
 
     fn prepare_send_method_selection(&mut self) {
@@ -190,29 +184,7 @@ where
     fn prepare_send_request(&mut self) {
         self.ptr = 0;
         self.buf[..3].copy_from_slice(&[0x05, self.command as u8, 0x00]);
-        match &self.target {
-            TargetAddr::Ip(SocketAddr::V4(addr)) => {
-                self.buf[3] = 0x01;
-                self.buf[4..8].copy_from_slice(&addr.ip().octets());
-                self.buf[8..10].copy_from_slice(&addr.port().to_be_bytes());
-                self.len = 10;
-            }
-            TargetAddr::Ip(SocketAddr::V6(addr)) => {
-                self.buf[3] = 0x04;
-                self.buf[4..20].copy_from_slice(&addr.ip().octets());
-                self.buf[20..22].copy_from_slice(&addr.port().to_be_bytes());
-                self.len = 22;
-            }
-            TargetAddr::Domain(domain, port) => {
-                self.buf[3] = 0x03;
-                let domain = domain.as_bytes();
-                let len = domain.len();
-                self.buf[4] = len as u8;
-                self.buf[5..5 + len].copy_from_slice(domain);
-                self.buf[(5 + len)..(7 + len)].copy_from_slice(&port.to_be_bytes());
-                self.len = 7 + len;
-            }
-        }
+        self.len = 3 + self.target.write_to(&mut self.buf[3..]);
     }
 
     fn prepare_recv_reply(&mut self) {
@@ -438,12 +410,13 @@ impl Socks5Listener {
         P: ToProxyAddrs,
         T: IntoTargetAddr<'t>,
     {
-        Ok(BindFuture(ConnectFuture::new(
+        ConnectFuture::new(
             Authentication::None,
             Command::Bind,
             proxy.to_proxy_addrs(),
             target.into_target_addr()?,
-        )))
+        )
+        .map(BindFuture)
     }
 
     /// Initiates a BIND request to the specified proxy using given username
@@ -465,12 +438,13 @@ impl Socks5Listener {
         P: ToProxyAddrs,
         T: IntoTargetAddr<'t>,
     {
-        Ok(BindFuture(ConnectFuture::new(
+        ConnectFuture::new(
             Authentication::Password { username, password },
             Command::Bind,
             proxy.to_proxy_addrs(),
             target.into_target_addr()?,
-        )))
+        )
+        .map(BindFuture)
     }
 
     /// Returns the address of the proxy-side TCP listener.
@@ -591,5 +565,137 @@ impl<'a> AsyncWrite for &'a Socks5Stream {
 
     fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
         AsyncWrite::write_buf(&mut &self.tcp, buf)
+    }
+}
+
+/// A SOCKS5 UDP client.
+pub struct Socks5Datagram {
+    udp: UdpSocket,
+    tcp: Socks5Stream,
+}
+
+impl Socks5Datagram {
+    /// Initiates a UDP ASSOCIATE request to the specified proxy.
+    ///
+    /// The client will use `addr` to send UDP datagrams.
+    ///
+    /// # Error
+    ///
+    /// It propagates the error that occurs in the conversion from `T` to `TargetAddr`.
+    pub fn associate<P, T>(proxy: P, addr: T) -> AssociateFuture<'static, P::Output, T::Output>
+    where
+        P: ToProxyAddrs,
+        T: ToProxyAddrs,
+    {
+        AssociateFuture::new(
+            Authentication::None,
+            proxy.to_proxy_addrs(),
+            addr.to_proxy_addrs(),
+        )
+    }
+
+    /// Initiates a UDP ASSOCIATE request to the specified proxy using given username
+    /// and password.
+    ///
+    /// The client will use `addr` to send UDP datagrams.
+    ///
+    /// # Error
+    ///
+    /// It propagates the error that occurs in the conversion from `T` to `TargetAddr`.
+    pub fn associate_with_password<'a, P, T>(
+        proxy: P,
+        addr: T,
+        username: &'a str,
+        password: &'a str,
+    ) -> AssociateFuture<'a, P::Output, T::Output>
+    where
+        P: ToProxyAddrs,
+        T: ToProxyAddrs,
+    {
+        AssociateFuture::new(
+            Authentication::Password { username, password },
+            proxy.to_proxy_addrs(),
+            addr.to_proxy_addrs(),
+        )
+    }
+
+    pub fn poll_send_to<'t, T>(&mut self, buf: &[u8], target: T) -> Poll<usize, Error>
+    where T: IntoTargetAddr<'t>
+    {
+        let addr = target.into_target_addr()?;
+//        let mut v = Vec::new();
+        unimplemented!()
+    }
+}
+
+/// A `Future` which resolves to a `Socks5Datagram`.
+pub enum AssociateFuture<'a, PS, BS>
+where
+    PS: Stream<Item = SocketAddr, Error = Error>,
+    BS: Stream<Item = SocketAddr, Error = Error>,
+{
+    Init(ConnectFuture<'a, 'static, PS>, Option<BS>),
+    Negotiated(Option<Socks5Stream>, BS),
+    Bound(Option<Socks5Stream>, Option<UdpSocket>, TargetAddrsStream),
+}
+
+impl<'a, PS, BS> AssociateFuture<'a, PS, BS>
+where
+    PS: Stream<Item = SocketAddr, Error = Error>,
+    BS: Stream<Item = SocketAddr, Error = Error>,
+{
+    fn new(auth: Authentication<'a>, proxy: PS, addr: BS) -> Self {
+        let conn_fut = ConnectFuture::new(
+            auth,
+            Command::Associate,
+            proxy,
+            SocketAddr::from(([0, 0, 0, 0], 0))
+                .into_target_addr()
+                .unwrap(),
+        )
+        .unwrap();
+        AssociateFuture::Init(conn_fut, Some(addr))
+    }
+}
+
+impl<'a, PS, BS> Future for AssociateFuture<'a, PS, BS>
+where
+    PS: Stream<Item = SocketAddr, Error = Error>,
+    BS: Stream<Item = SocketAddr, Error = Error>,
+{
+    type Item = Socks5Datagram;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            match self {
+                AssociateFuture::Init(conn_fut, addr) => {
+                    let tcp = try_ready!(conn_fut.poll());
+                    *self = AssociateFuture::Negotiated(Some(tcp), addr.take().unwrap())
+                },
+                AssociateFuture::Negotiated(tcp, addr) => {
+                    if let Some(addr) = try_ready!(addr.poll()) {
+                        if let Ok(udp) = UdpSocket::bind(&addr) {
+                            let target_addrs = tcp.as_ref().unwrap().target_addr().to_proxy_addrs();
+                            *self = AssociateFuture::Bound(tcp.take(), Some(udp), target_addrs);
+                        } else {
+                            Err(Error::UdpBindFailure)?
+                        }
+                    }
+                },
+                AssociateFuture::Bound(tcp, udp, addr) => {
+                    if let Some(addr) = try_ready!(addr.poll()) {
+                        if udp.as_ref().unwrap().connect(&addr).is_ok() {
+                            return Ok(Async::Ready(Socks5Datagram {
+                                tcp: tcp.take().unwrap(),
+                                udp: udp.take().unwrap()
+                            }));
+                        }
+                    } else {
+                        Err(Error::ProxyServerUnreachable)?
+                    }
+                }
+            }
+        }
     }
 }

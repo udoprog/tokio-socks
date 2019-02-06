@@ -12,8 +12,8 @@ use std::{
     vec,
 };
 
-pub use error::Error;
-use error::Result;
+pub use error::{Error, Result};
+pub use v5::{Socks5Listener, Socks5Stream};
 
 /// A trait for objects which can be converted or resolved to one or more `SocketAddr` values,
 /// which are going to be connected as the the proxy server.
@@ -76,6 +76,7 @@ impl<'a, T: ToProxyAddrs + ?Sized> ToProxyAddrs for &'a T {
     }
 }
 
+#[doc(hidden)]
 pub struct ProxyAddrsStream(Option<io::Result<vec::IntoIter<SocketAddr>>>);
 
 impl Stream for ProxyAddrsStream {
@@ -116,6 +117,35 @@ impl<'a> TargetAddr<'a> {
             }
         }
     }
+
+    /// Writes ATYP, address and port to `buf` and returns how many bytes are written.
+    ///
+    /// It panics if the size of `buf` is smaller than required.
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        match self {
+            TargetAddr::Ip(SocketAddr::V4(addr)) => {
+                buf[0] = 0x01;
+                buf[1..5].copy_from_slice(&addr.ip().octets());
+                buf[5..7].copy_from_slice(&addr.port().to_be_bytes());
+                7
+            },
+            TargetAddr::Ip(SocketAddr::V6(addr)) => {
+                buf[0] = 0x04;
+                buf[1..17].copy_from_slice(&addr.ip().octets());
+                buf[17..19].copy_from_slice(&addr.port().to_be_bytes());
+                19
+            },
+            TargetAddr::Domain(domain, port) => {
+                let domain = domain.as_bytes();
+                let len = domain.len();
+                buf[0] = 0x03;
+                buf[1] = len as u8;
+                buf[2..2 + len].copy_from_slice(domain);
+                buf[(2 + len)..(4 + len)].copy_from_slice(&port.to_be_bytes());
+                4 + len
+            },
+        }
+    }
 }
 
 impl<'a> ToSocketAddrs for TargetAddr<'a> {
@@ -127,6 +157,31 @@ impl<'a> ToSocketAddrs for TargetAddr<'a> {
             TargetAddr::Domain(domain, port) => {
                 Either::Right((&**domain, *port).to_socket_addrs()?)
             }
+        })
+    }
+}
+
+pub struct TargetAddrsStream(Either<Once<SocketAddr, Error>, ProxyAddrsStream>);
+
+impl Stream for TargetAddrsStream {
+    type Item = SocketAddr;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match &mut self.0 {
+            Either::Left(stream) => stream.poll(),
+            Either::Right(stream) => stream.poll()
+        }
+    }
+}
+
+impl<'a> ToProxyAddrs for TargetAddr<'a> {
+    type Output = TargetAddrsStream;
+
+    fn to_proxy_addrs(&self) -> Self::Output {
+        TargetAddrsStream(match self {
+            TargetAddr::Ip(addr) => Either::Left(addr.to_proxy_addrs()),
+            TargetAddr::Domain(domain, port) => Either::Right((&**domain, *port).to_proxy_addrs())
         })
     }
 }
@@ -231,7 +286,7 @@ impl<'a> Authentication<'a> {
 }
 
 mod error;
-pub mod tcp;
+pub mod v5;
 
 #[cfg(test)]
 mod tests {

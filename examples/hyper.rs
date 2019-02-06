@@ -6,7 +6,7 @@ use hyper::{
 };
 use std::io::{prelude::*, stdout};
 use std::net::SocketAddr;
-use tokio_socks::{tcp::Socks5Stream, Error};
+use tokio_socks::{v5::Socks5Stream, Error};
 use tokio_tcp::TcpStream;
 
 struct Connector {
