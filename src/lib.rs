@@ -128,13 +128,13 @@ impl<'a> TargetAddr<'a> {
                 buf[1..5].copy_from_slice(&addr.ip().octets());
                 buf[5..7].copy_from_slice(&addr.port().to_be_bytes());
                 7
-            },
+            }
             TargetAddr::Ip(SocketAddr::V6(addr)) => {
                 buf[0] = 0x04;
                 buf[1..17].copy_from_slice(&addr.ip().octets());
                 buf[17..19].copy_from_slice(&addr.port().to_be_bytes());
                 19
-            },
+            }
             TargetAddr::Domain(domain, port) => {
                 let domain = domain.as_bytes();
                 let len = domain.len();
@@ -143,7 +143,16 @@ impl<'a> TargetAddr<'a> {
                 buf[2..2 + len].copy_from_slice(domain);
                 buf[(2 + len)..(4 + len)].copy_from_slice(&port.to_be_bytes());
                 4 + len
-            },
+            }
+        }
+    }
+
+    /// Returns the number of bytes written by the `write_to` function.
+    fn size_hint(&self) -> usize {
+        match self {
+            TargetAddr::Ip(SocketAddr::V4(_)) => 7,
+            TargetAddr::Ip(SocketAddr::V6(_)) => 19,
+            TargetAddr::Domain(domain, _) => 4 + domain.as_bytes().len(),
         }
     }
 }
@@ -170,7 +179,7 @@ impl Stream for TargetAddrsStream {
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         match &mut self.0 {
             Either::Left(stream) => stream.poll(),
-            Either::Right(stream) => stream.poll()
+            Either::Right(stream) => stream.poll(),
         }
     }
 }
@@ -181,7 +190,7 @@ impl<'a> ToProxyAddrs for TargetAddr<'a> {
     fn to_proxy_addrs(&self) -> Self::Output {
         TargetAddrsStream(match self {
             TargetAddr::Ip(addr) => Either::Left(addr.to_proxy_addrs()),
-            TargetAddr::Domain(domain, port) => Either::Right((&**domain, *port).to_proxy_addrs())
+            TargetAddr::Domain(domain, port) => Either::Right((&**domain, *port).to_proxy_addrs()),
         })
     }
 }

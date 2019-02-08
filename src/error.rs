@@ -66,6 +66,9 @@ pub enum Error {
     /// UDP bind failure
     #[fail(display = "Unable to bind a UDP socket")]
     UdpBindFailure,
+    /// Incomplete UDP header
+    #[fail(display = "Incomplete UDP header")]
+    IncompleteUdpHeader,
 }
 
 impl From<std::io::Error> for Error {

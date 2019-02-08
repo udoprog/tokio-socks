@@ -1,4 +1,6 @@
-use crate::{Authentication, Error, IntoTargetAddr, Result, TargetAddr, ToProxyAddrs, TargetAddrsStream};
+use crate::{
+    Authentication, Error, IntoTargetAddr, Result, TargetAddr, TargetAddrsStream, ToProxyAddrs,
+};
 use bytes::{Buf, BufMut};
 use derefable::Derefable;
 use futures::{stream, try_ready, Async, Future, Poll, Stream};
@@ -619,12 +621,31 @@ impl Socks5Datagram {
         )
     }
 
-    pub fn poll_send_to<'t, T>(&mut self, buf: &[u8], target: T) -> Poll<usize, Error>
-    where T: IntoTargetAddr<'t>
+    /// Creates a future that will write the entire contents of the buffer `buf`
+    /// as a datagram through this proxy.
+    ///
+    /// The returned future will return after data has been written to the outbound socket.
+    ///
+    /// Note that this function clones the contents of `buf` and then moves the ownership
+    /// to the returned future.
+    ///
+    /// # Error
+    ///
+    /// It propagates the error that occurs in the conversion from `T` to `TargetAddr`.
+    pub fn send_dgram<'t, T>(self, buf: &[u8], target: T) -> Result<SendDgram>
+    where
+        T: IntoTargetAddr<'t>,
     {
         let addr = target.into_target_addr()?;
-//        let mut v = Vec::new();
-        unimplemented!()
+        // +----+------+------+----------+----------+----------+
+        // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+        // +----+------+------+----------+----------+----------+
+        // | 2  |  1   |  1   | Variable |    2     | Variable |
+        // +----+------+------+----------+----------+----------+
+        let mut v = vec![0; 3 + addr.size_hint() + buf.len()];
+        let written = addr.write_to(&mut v[3..]);
+        v[(3 + written)..].copy_from_slice(buf);
+        Ok(SendDgram::new(self, v, 3 + written))
     }
 }
 
@@ -672,7 +693,7 @@ where
                 AssociateFuture::Init(conn_fut, addr) => {
                     let tcp = try_ready!(conn_fut.poll());
                     *self = AssociateFuture::Negotiated(Some(tcp), addr.take().unwrap())
-                },
+                }
                 AssociateFuture::Negotiated(tcp, addr) => {
                     if let Some(addr) = try_ready!(addr.poll()) {
                         if let Ok(udp) = UdpSocket::bind(&addr) {
@@ -682,13 +703,13 @@ where
                             Err(Error::UdpBindFailure)?
                         }
                     }
-                },
+                }
                 AssociateFuture::Bound(tcp, udp, addr) => {
                     if let Some(addr) = try_ready!(addr.poll()) {
                         if udp.as_ref().unwrap().connect(&addr).is_ok() {
                             return Ok(Async::Ready(Socks5Datagram {
                                 tcp: tcp.take().unwrap(),
-                                udp: udp.take().unwrap()
+                                udp: udp.take().unwrap(),
                             }));
                         }
                     } else {
@@ -697,5 +718,47 @@ where
                 }
             }
         }
+    }
+}
+
+/// A `Future` used to send UDP datagrams through proxy.
+///
+/// The `usize` in the returned tuple indicates how many bytes provided by user
+/// are written. The SOCKS5 UDP header bytes don't count.
+///
+/// If the SOCKS5 UDP header is not completely sent, `Error::IncompleteUdpHeader`
+/// is returned.
+///
+/// This is created by the `Socks5Datagram::send_dgram` function.
+pub struct SendDgram {
+    udp: Option<Socks5Datagram>,
+    data: Vec<u8>,
+    header_len: usize,
+}
+
+impl SendDgram {
+    fn new(udp: Socks5Datagram, data: Vec<u8>, header_len: usize) -> Self {
+        SendDgram {
+            udp: Some(udp),
+            data,
+            header_len,
+        }
+    }
+}
+
+impl Future for SendDgram {
+    type Item = (Socks5Datagram, usize);
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let udp = &mut self.udp.as_mut().unwrap().udp;
+        let len = try_ready!(udp.poll_send(&self.data));
+        if len < self.header_len {
+            Err(Error::IncompleteUdpHeader)?
+        }
+        Ok(Async::Ready((
+            self.udp.take().unwrap(),
+            len - self.header_len,
+        )))
     }
 }
